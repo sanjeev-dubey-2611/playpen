@@ -10,7 +10,7 @@ import math
 from shapely.geometry import Point
 
 from players.player0 import Player
-from src.enclosure import Construction, validate_construction
+from src.enclosure import Construction, validate_construction, walk_points
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 
 HEADINGS = list(range(0, 180, 15))
@@ -335,8 +335,33 @@ class Player9(Player):
             pieces.append(p)
         return pieces
 
-    # ---- placement: centroid then grid of anchors, several headings ----
+    # ---- placement: room edges/corners, then centroid and grid fallback ----
     def _place(self, pieces, conns) -> Construction | None:
+        pts = walk_points(Construction((0.0, 0.0), 0, pieces, conns))
+        corners = [i for i, conn in enumerate(conns) if not conn.is_straight()]
+        room_pts = list(self.room.polygon.exterior.coords)[:-1]
+        # Sample at most 16 room edges and 8 enclosure corners: <= 256 tries.
+        corners = corners[:: max(1, math.ceil(len(corners) / 8))]
+        step = max(1, math.ceil(len(room_pts) / 16))
+        for j in range(0, len(room_pts), step):
+            a, b = room_pts[j], room_pts[(j + 1) % len(room_pts)]
+            if a == b:
+                continue
+            # Both directions handle either winding of the room boundary.
+            for (ax, ay), (bx, by) in ((a, b), (b, a)):
+                room_angle = math.atan2(by - ay, bx - ax)
+                for i in corners:
+                    x, y = pts[i]
+                    nx, ny = pts[i + 1]
+                    angle = room_angle - math.atan2(ny - y, nx - x)
+                    c, s = math.cos(angle), math.sin(angle)
+                    # Rotate the outgoing edge parallel to the room edge,
+                    # then translate this enclosure vertex onto its endpoint.
+                    start = (ax - (c * x - s * y), ay - (s * x + c * y))
+                    cons = Construction(start, math.degrees(angle), pieces, conns)
+                    if validate_construction(cons, self.room, self.inventory).valid:
+                        return cons
+
         cen = self.room.polygon.centroid
         for hd in HEADINGS:
             cons = self._at(pieces, conns, (cen.x, cen.y), hd)
