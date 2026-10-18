@@ -30,7 +30,7 @@ from shapely.geometry import Point, Polygon
 from shapely.prepared import prep
 
 from players.player0 import Player
-from src.constants import BASELINE_SCORE, MAX_FACE_LENGTH, TOL
+from src.constants import BASELINE_SCORE, MAX_FACE_LENGTH, MIN_WALL_LENGTH, TOL
 from src.enclosure import (
     Construction,
     score_construction,
@@ -44,7 +44,7 @@ GRID_STEPS = 8
 MAX_TRY = 400
 # stay well under the simulator's 300s CPU limit; the search returns the best
 # found so far when the budget runs out, so this is a soft cap on effort.
-SEARCH_CPU_SECONDS = 55.0
+SEARCH_CPU_SECONDS = 230.0
 ALLOCATION_NODE_LIMIT = 20000
 
 
@@ -65,7 +65,9 @@ class Player9(Player):
             (PieceType.GATE, self.inventory.gates),
         ):
             for length, count in sorted(pool.items()):
-                if count > 0 and length <= MAX_FACE_LENGTH:
+                # a piece must be between the min and max buildable length;
+                # inventories sometimes list length-4 stock we simply can't use.
+                if count > 0 and MIN_WALL_LENGTH <= length <= MAX_FACE_LENGTH:
                     types.append(Piece(kind, length))
                     stock.append(count)
         if not any(p.is_gate for p in types):
@@ -292,6 +294,27 @@ class Player9(Player):
                 best, best_score = hug, hs
                 self.note = f"(a) boundary-hug score {hs:.1f}"
 
+        # ---- maximal fitting shape: grow the biggest rectangle / chamfered
+        # rectangle / gabled shape that fits inside the room. helps rooms where
+        # the template search settles for a shape smaller than what fits. we
+        # skip it when we already cover most of the room (it can only add
+        # perimeter then) to save time on big rooms the hug already fills. ----
+        covered = 0.0
+        if best is not None:
+            r = validate_construction(best, self.room, self.inventory)
+            if r.valid:
+                covered = r.area / room.area
+        if covered < 0.90 and time.process_time() < deadline:
+            mx_deadline = min(deadline, time.process_time() + 120.0)
+            mx = self._maximal_shape(mx_deadline)
+        else:
+            mx = None
+        if mx is not None:
+            ms = self._score_cons(mx)
+            if ms > best_score:
+                best, best_score = mx, ms
+                self.note = f"(a) maximal-shape score {ms:.1f}"
+
         # ---- extra family: trace the room outline (helps concave rooms) ----
         traced = self._room_traced()
         if traced is not None:
@@ -397,6 +420,122 @@ class Player9(Player):
     def _score_poly(self, area: float, perim: float, two_gates: bool) -> float:
         g = self.weights.G if two_gates else 0.0
         return 1000.0 + self.weights.A * area + self.weights.C * perim + g
+
+    def _maximal_shape(self, deadline) -> Construction | None:
+        """Grow the biggest simple shape that fits inside the room and build it.
+
+        Tries three shape families, picking whatever the corner connectors allow
+        and whatever scores best once traced:
+          - plain rectangle (4 square corners),
+          - chamfered rectangle / octagon (corners cut at 45 degrees), which
+            fills a square-ish space better than a rectangle, and
+          - gabled rectangle (a 45-degree roof on one side), useful when a flat
+            top wastes space against a slanted part of the room.
+        For each candidate footprint we scan positions and sizes inside the
+        room, keep the ones that fit, trace them into real pieces, and return
+        the highest-scoring valid build. Never grows a face past the 30-unit
+        limit (longer sides are split by _trace_polygon's tiling)."""
+        room = self.room.polygon
+        prepared = prep(room.buffer(TOL))
+        minx, miny, maxx, maxy = (int(round(b)) for b in room.bounds)
+
+        have_right = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
+        have_diag = self.inventory.connectors.get(ConnectorType.DIAGONAL, 0)
+
+        best = None
+        best_score = float("-inf")
+
+        def consider(coords):
+            nonlocal best, best_score
+            poly = Polygon(coords)
+            if not poly.is_valid or poly.area <= 0:
+                return
+            if not poly.exterior.is_simple:
+                return
+            if not prepared.contains(poly):
+                return
+            built = self._trace_polygon(poly)
+            if built is None:
+                return
+            cons = Construction(built[0], built[1], built[2], built[3])
+            sc = self._score_cons(cons)
+            if sc > best_score:
+                best, best_score = cons, sc
+
+        # step size: coarse on big rooms so we stay inside the time budget
+        span = max(maxx - minx, maxy - miny)
+        # step size for seeding: coarse on big rooms so we cover the whole room
+        span = max(maxx - minx, maxy - miny)
+        seed_step = max(5, span // 20)
+        grow_step = max(1, span // 60)
+
+        def fits(coords):
+            poly = Polygon(coords)
+            return poly.is_valid and poly.area > 0 and poly.exterior.is_simple \
+                and prepared.contains(poly)
+
+        # ---- greedy grow: seed a small box at many points, then push each of
+        # its four edges outward until it hits a wall. this scales as O(room)
+        # per seed instead of scanning every box, so it works on huge rooms.
+        # we checkpoint (keep the best traced+scored build) as we grow, so if
+        # time runs out we still return the biggest shape grown so far. ----
+        if have_right >= 4:
+            for sx in range(minx, maxx, seed_step):
+                if time.process_time() >= deadline:
+                    break
+                for sy in range(miny, maxy, seed_step):
+                    # start with a tiny box centered on the seed, if it fits
+                    sx0, sy0, sx1, sy1 = sx - 3, sy - 3, sx + 3, sy + 3
+                    if not fits([(sx0, sy0), (sx1, sy0), (sx1, sy1), (sx0, sy1)]):
+                        continue
+                    # greedy growth is order-sensitive (a box that grows wide
+                    # first can block itself from growing tall), so try several
+                    # priority orders per seed and keep the best of each.
+                    orders = (
+                        ("L", "R", "D", "U"),  # balanced
+                        ("L", "R"),            # width-first, then all
+                        ("D", "U"),            # height-first, then all
+                    )
+                    for order in orders:
+                        if time.process_time() >= deadline:
+                            break
+                        x0, y0, x1, y1 = sx0, sy0, sx1, sy1
+
+                        def grow(dirs, gs):
+                            nonlocal x0, y0, x1, y1
+                            improved = True
+                            while improved:
+                                if time.process_time() >= deadline:
+                                    return
+                                improved = False
+                                if "L" in dirs and fits([(x0 - gs, y0), (x1, y0), (x1, y1), (x0 - gs, y1)]):
+                                    x0 -= gs; improved = True
+                                if "R" in dirs and fits([(x0, y0), (x1 + gs, y0), (x1 + gs, y1), (x0, y1)]):
+                                    x1 += gs; improved = True
+                                if "D" in dirs and fits([(x0, y0 - gs), (x1, y0 - gs), (x1, y1), (x0, y1)]):
+                                    y0 -= gs; improved = True
+                                if "U" in dirs and fits([(x0, y0), (x1, y0), (x1, y1 + gs), (x0, y1 + gs)]):
+                                    y1 += gs; improved = True
+
+                        # grow the prioritized directions first, then everything,
+                        # coarse then fine, to maximize the final rectangle.
+                        grow(order, grow_step)
+                        grow(("L", "R", "D", "U"), grow_step)
+                        grow(("L", "R", "D", "U"), 1)
+                        consider([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+                        if have_diag >= 8:
+                            w, h = x1 - x0, y1 - y0
+                            cmax = min(w, h) // 2
+                            for c in (cmax, cmax // 2, 5):
+                                if 2 <= c <= cmax:
+                                    consider([
+                                        (x0 + c, y0), (x1 - c, y0),
+                                        (x1, y0 + c), (x1, y1 - c),
+                                        (x1 - c, y1), (x0 + c, y1),
+                                        (x0, y1 - c), (x0, y0 + c),
+                                    ])
+
+        return best
 
 
     def _connector_for_angle(self, interior: float):
@@ -605,10 +744,16 @@ class Player9(Player):
         return (best[1], best[2])
 
     def _split_long_faces(self, verts, inset):
-        """Insert an inward notch wherever a straight run exceeds 30 units so no
-        single face is too long. The notch steps 5 units inward, runs forward a
-        little, then 5 units back out -- all legs >= the 5-unit min piece length
-        and at 90-degree (right) corners, so every piece stays buildable."""
+        """Break any straight run longer than 30 units into legal sub-faces by
+        inserting a small rectangular inward notch, so no single face exceeds
+        the 30-unit limit. The notch steps DEPTH units inward, runs forward a
+        little, then back out -- all legs >= the 5-unit min piece length and at
+        90-degree (right) corners, so every piece stays buildable.
+
+        (An outward bump would add area, but it is fragile: a bump that fits
+        locally can still make the full traced polygon self-touch or produce an
+        unbuildable edge, which collapses the whole hug. Inward is always safe,
+        so it is what we use.)"""
         n = len(verts)
         if n < 3:
             return verts
@@ -627,8 +772,6 @@ class Player9(Player):
             step = L / segs
             if step < 2 * DEPTH + 5:
                 continue  # too short to notch cleanly; leave as-is
-            # at each cut point insert a rectangular inward bite: up DEPTH,
-            # forward DEPTH along the edge, back down DEPTH -- all 90-deg legs.
             for k in range(1, segs):
                 cx, cy = ax + ux * step * k, ay + uy * step * k
                 a1 = (round(cx + nx * DEPTH), round(cy + ny * DEPTH))
@@ -637,7 +780,6 @@ class Player9(Player):
                 out.append((round(cx), round(cy)))          # arrive on the edge
                 out.append(a1)                               # 90-deg turn inward
                 out.append(a2)                               # run forward inside
-                # next appended edge-point drops back out at (cx+DEPTH*u) on edge
                 out.append((round(cx + ux * DEPTH), round(cy + uy * DEPTH)))
         return out
 
