@@ -86,6 +86,17 @@ class Player9(Player):
                     best, best_score = ff, fs
                     self.note = f"(a) free-form score {fs:.1f}"
 
+        # ---- best fitting rectangle: a cheap exhaustive scan that guarantees
+        # we match a simple-rectangle opponent on rooms where the growers get
+        # trapped (tight / spiral rooms). competes on true score. ----
+        if time.process_time() < deadline:
+            rect = self._best_rectangle(min(deadline, time.process_time() + 30.0))
+            if rect is not None:
+                rs = self._score_cons(rect)
+                if rs > best_score:
+                    best, best_score = rect, rs
+                    self.note = f"(a) best-rectangle score {rs:.1f}"
+
         # ---- piece stock as parallel (types, counts) lists ----
         types: list[Piece] = []
         stock: list[int] = []
@@ -375,6 +386,57 @@ class Player9(Player):
 
         if best is None:
             self.note = "No valid positive-scoring enclosure found."
+        return best
+
+    def _best_rectangle(self, deadline) -> Construction | None:
+        """Scan for the single highest-scoring axis-aligned rectangle that fits
+        in the room and can be built from inventory. Cheap and exhaustive on
+        small/medium rooms -- guarantees we never lose to a simple-rectangle
+        opponent on rooms where our greedy growers get trapped (e.g. tight
+        spiral rooms where only a small box fits). Competes on true score."""
+        from shapely.geometry import Polygon as _P
+        from shapely.prepared import prep as _prep
+
+        room = self.room.polygon
+        pr = _prep(room.buffer(TOL))
+        minx, miny, maxx, maxy = (int(math.floor(b)) for b in room.bounds)
+        span = max(maxx - minx, maxy - miny)
+        step = 1 if span <= 60 else max(1, span // 60)
+
+        best = None
+        best_score = float("-inf")
+        # rank candidate (w, h) by the score they'd give if placed, best first,
+        # so we can stop early once no bigger box can beat the incumbent.
+        sizes = []
+        for w in range(5, MAX_FACE_LENGTH + 1):
+            for h in range(w, MAX_FACE_LENGTH + 1):
+                upper = self._score_poly(w * h, 2 * (w + h), True)
+                if upper > 0:
+                    sizes.append((upper, w, h))
+        sizes.sort(reverse=True)
+
+        for upper, w, h in sizes:
+            if time.process_time() >= deadline or upper <= best_score:
+                break
+            for ow, oh in ((w, h), (h, w)):
+                placed = False
+                for ox in range(minx, maxx - ow + 1, step):
+                    for oy in range(miny, maxy - oh + 1, step):
+                        rect = _P([(ox, oy), (ox + ow, oy),
+                                   (ox + ow, oy + oh), (ox, oy + oh)])
+                        if not pr.contains(rect):
+                            continue
+                        built = self._trace_polygon(rect)
+                        if built is None:
+                            continue
+                        cons = Construction(*built)
+                        sc = self._score_cons(cons)
+                        if sc > best_score:
+                            best, best_score = cons, sc
+                        placed = True
+                        break  # one placement per size is enough
+                    if placed:
+                        break
         return best
 
     def _legacy_search(self, best_score: float):
