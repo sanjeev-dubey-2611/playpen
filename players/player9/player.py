@@ -109,6 +109,22 @@ class Player9(Player):
                     best, best_score = band, bs
                     self.note = f"(a) notched-band score {bs:.1f}"
 
+        # ---- chain-shape: ROTATED rectilinear templates (rect/plus/pinwheel)
+        # built by piece-chaining, for rooms whose best shape is rotated to the
+        # room's own symmetry axis (star, pinwheel rooms). Only worthwhile on
+        # small rooms -- on large rooms the grid/freeform dominate and this would
+        # just burn time -- so gate on room span. Competes on true score. ----
+        if time.process_time() < deadline:
+            rminx, rminy, rmaxx, rmaxy = self.room.polygon.bounds
+            rspan = max(rmaxx - rminx, rmaxy - rminy)
+            if rspan <= 60:
+                chain = self._chain_shape(min(deadline, time.process_time() + 45.0))
+                if chain is not None:
+                    cs = self._score_cons(chain)
+                    if cs > best_score:
+                        best, best_score = chain, cs
+                        self.note = f"(a) chain-shape score {cs:.1f}"
+
         # ---- piece stock as parallel (types, counts) lists ----
         types: list[Piece] = []
         stock: list[int] = []
@@ -622,6 +638,228 @@ class Player9(Player):
             # is notched.
             pts.append((s0, vt))
         return [to_world(uu, vv) for uu, vv in pts]
+
+    def _chain_shape(self, deadline) -> Construction | None:
+        """Piece-chaining candidate generator for ROTATED rectilinear shapes.
+
+        Our other generators build a polygon from geometric vertices, then
+        require every edge to be an integer length -- which a rotated shape
+        violates (its edges project to irrational lengths). This builds the
+        shape the way the engine itself does: as a turtle walk of integer-length
+        PIECES at an arbitrary start heading. The vertices land wherever they
+        land (non-integer is fine); only the piece lengths must be integers and
+        each linear face must be <= 30. This unblocks rooms whose best shape is a
+        rectangle / plus / pinwheel rotated to the room's own symmetry axis
+        (e.g. star, hard), which the lattice grower and vertex tracers cannot
+        represent.
+
+        We enumerate a handful of templates as rings of (edge_length, turn_sign)
+        (turn +1 = convex 90, -1 = reflex 270), scan rotation angle + a size
+        scale + center offset, place a gate on the first long-enough face, and
+        keep the best valid build (true score).
+        """
+        room = self.room.polygon
+        minx, miny, maxx, maxy = room.bounds
+        cx0, cy0 = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+        span = max(maxx - minx, maxy - miny)
+
+        gate_lengths = sorted(L for L, cnt in self.inventory.gates.items()
+                              if cnt > 0 and 5 <= L <= MAX_FACE_LENGTH)
+        if not gate_lengths:
+            return None
+        gmin = gate_lengths[0]
+
+        # edge builders: split an integer edge length into wall pieces <= 30,
+        # optionally seating one gate. returns list[(PieceType, L)] or None.
+        def build_edge(total, want_gate):
+            return self._tile_run(int(round(total)),
+                                  dict(self.inventory.walls),
+                                  dict(self.inventory.gates), want_gate)
+
+        # templates: each returns a ring of (length, turn_sign). lengths are
+        # parametrised by integer dims. turn_sign +1 convex(90), -1 reflex(270).
+        def tmpl_rect(w, h):
+            return [(w, +1), (h, +1), (w, +1), (h, +1)]
+
+        def tmpl_plus(arm, th):
+            # a symmetric plus: arm length `arm`, bar thickness `th`.
+            return [(th, +1), (arm, +1), (th, -1), (arm, +1),
+                    (th, +1), (arm, +1), (th, -1), (arm, +1),
+                    (th, +1), (arm, +1), (th, -1), (arm, +1)]
+
+        def tmpl_pinwheel_p10(a, b, s, c_):
+            # topology of p10's star winner: lens [a,b,s,s,c,s,s,s,c,s,s,b] with
+            # turns +,+,-,+,+,-,+,+,-,+,+,- (sum 4). `c_` is scanned freely; the
+            # walk-closure check in _ring_to_construction rejects combos that
+            # don't close, so we don't need a closed-form for it.
+            turns = [+1, +1, -1, +1, +1, -1, +1, +1, -1, +1, +1, -1]
+            lens = [a, b, s, s, c_, s, s, s, c_, s, s, b]
+            return list(zip(lens, turns))
+
+        templates = []
+        maxdim = min(int(span), MAX_FACE_LENGTH)
+        for w in range(6, maxdim + 1, 2):
+            for h in range(6, maxdim + 1, 2):
+                templates.append(tmpl_rect(w, h))
+        for arm in range(6, min(maxdim, 18) + 1, 2):
+            for th in range(max(5, gmin), min(arm, 16) + 1, 2):
+                templates.append(tmpl_plus(arm, th))
+        # pinwheel family (unblocks rotated star/pinwheel rooms). c_ scanned.
+        for a in range(8, min(maxdim, 20) + 1):
+            for b in range(5, min(a, 14) + 1):
+                for s in range(5, 9):
+                    for c_ in range(5, min(maxdim, 16) + 1):
+                        templates.append(tmpl_pinwheel_p10(a, b, s, c_))
+
+        best = None
+        best_score = float("-inf")
+        # fine rotation: rectilinear shapes repeat every 90, but the room's
+        # symmetry axis can be any angle, so scan the full quarter finely.
+        rots = [r for r in range(0, 90, 3)]
+
+        # PRE-FILTER: keep only templates whose turtle walk actually CLOSES
+        # (position + heading return to start). Closure is rotation/translation
+        # invariant, so we test each template once at rot 0 with a cheap walk --
+        # this throws out the vast majority of (a,b,s,c) combos before the
+        # expensive per-rotation/offset build+validate scan.
+        def closes(ring):
+            if sum(s for _, s in ring) != 4:
+                return False
+            x = y = 0.0
+            hd = 0.0
+            for i, (L, sgn) in enumerate(ring):
+                hd += 90.0 if sgn > 0 else -90.0
+                x += L * math.cos(math.radians(hd))
+                y += L * math.sin(math.radians(hd))
+            return math.hypot(x, y) < 1e-6
+
+        closed = [r for r in templates if closes(r)]
+
+        # center offsets: fine grid so we can slide the shape into the room's
+        # best position. kept small (per-step 2 units) and bounded.
+        step = 2.0
+        rng = max(step, span * 0.25)
+        n_off = int(rng / step)
+        offs = [0.0] + [k * step for k in range(1, n_off + 1)] \
+            + [-k * step for k in range(1, n_off + 1)]
+
+        best = None
+        best_score = float("-inf")
+        # keep the top-K distinct (ring, rot) candidates by coarse score, so the
+        # fine refine isn't locked to a single template that merely won the
+        # coarse round on a lucky offset -- the true optimum may belong to a
+        # template whose coarse-grid score was slightly lower.
+        import heapq
+        topk = []  # (score, tiebreak, ring, rot, ox, oy)
+        tie = 0
+        for ring in closed:
+            if time.process_time() >= deadline:
+                break
+            for rot in rots:
+                if time.process_time() >= deadline:
+                    break
+                for ox in offs:
+                    for oy in offs:
+                        cons = self._ring_to_construction(
+                            ring, rot, cx0 + ox, cy0 + oy, build_edge, gmin)
+                        if cons is None:
+                            continue
+                        sc = self._score_cons(cons)
+                        if sc > best_score:
+                            best, best_score = cons, sc
+                        tie += 1
+                        if len(topk) < 8:
+                            heapq.heappush(topk, (sc, tie, ring, rot, ox, oy))
+                        elif sc > topk[0][0]:
+                            heapq.heapreplace(topk, (sc, tie, ring, rot, ox, oy))
+
+        # LOCAL REFINE: slide each top candidate on a fine (0.5-unit) grid to
+        # recover sub-`step` area the coarse scan missed (optima often sit on
+        # fractional offsets).
+        fine = [d * 0.5 for d in range(-6, 7)]
+        for _sc, _t, ring, rot, ox0, oy0 in sorted(topk, reverse=True):
+            if time.process_time() >= deadline:
+                break
+            for dx in fine:
+                for dy in fine:
+                    cons = self._ring_to_construction(
+                        ring, rot, cx0 + ox0 + dx, cy0 + oy0 + dy, build_edge, gmin)
+                    if cons is None:
+                        continue
+                    sc = self._score_cons(cons)
+                    if sc > best_score:
+                        best, best_score = cons, sc
+        return best
+
+    def _ring_to_construction(self, ring, rot, cx, cy, build_edge, gmin):
+        """Turn a template ring of (edge_length, turn_sign) into a valid
+        Construction at rotation `rot`, centered near (cx, cy). Builds each edge
+        (splitting >30, seating one gate on the first capable edge), lays out the
+        pieces/connectors, recenters the loop on (cx, cy), and returns it only if
+        the walk closes and fits. Vertices may be non-integer; only piece lengths
+        are integers."""
+        # choose the gate edge. prefer an edge whose length EXACTLY equals an
+        # available gate length (seats cleanly, needs no extra wall); otherwise
+        # fall back to any edge that can hold the smallest gate with a buildable
+        # remainder. `build_edge` does the real tiling/inventory check, so we
+        # just pick a reasonable candidate order here.
+        gate_set = {L for L, cnt in self.inventory.gates.items()
+                    if cnt > 0 and 5 <= L <= MAX_FACE_LENGTH}
+        gate_edge = None
+        for i, (L, _) in enumerate(ring):
+            if int(round(L)) in gate_set:
+                gate_edge = i
+                break
+        if gate_edge is None:
+            for i, (L, _) in enumerate(ring):
+                if L >= gmin and (L - gmin == 0 or L - gmin >= MIN_WALL_LENGTH):
+                    gate_edge = i
+                    break
+        if gate_edge is None:
+            return None
+
+        pieces: list[Piece] = []
+        conns: list[Connector] = []
+        # connectors[i] is the turn INTO piece i; connectors[0] is the closing
+        # turn (end of last edge back to first). We assemble per-edge runs and
+        # set the FIRST piece of each edge to carry the corner turn, the rest
+        # STRAIGHT.
+        edge_runs = []
+        for i, (L, sgn) in enumerate(ring):
+            segs = build_edge(L, i == gate_edge)
+            if segs is None:
+                return None
+            edge_runs.append((segs, sgn))
+
+        # corner turn for edge i is placed at its first piece; it reflects the
+        # turn FROM the previous edge INTO this edge. For a CCW ring, convex=+90
+        # (RIGHT), reflex=-90 (RIGHT flipped => internal 270). The turn at the
+        # start of edge i is determined by edge i's own sign.
+        for i, (segs, sgn) in enumerate(edge_runs):
+            for si, (ptype, L) in enumerate(segs):
+                pieces.append(Piece(ptype, L))
+                if si == 0:
+                    conns.append(Connector(ConnectorType.RIGHT, reflex=(sgn < 0)))
+                else:
+                    conns.append(Connector(ConnectorType.STRAIGHT, False))
+        if len(conns) != len(pieces) or len(pieces) < 5:
+            return None
+
+        # walk from origin at heading rot, then translate to center on (cx, cy)
+        from src.enclosure import build_geometry as _bg
+        trial = Construction((0.0, 0.0), float(rot), pieces, conns)
+        try:
+            verts, pos_gap, head_gap = _bg(trial)
+        except Exception:
+            return None
+        if pos_gap > 1e-3 or abs(head_gap) > 1e-3:
+            return None  # doesn't close
+        xs = [p[0] for p in verts]
+        ys = [p[1] for p in verts]
+        shift_x = cx - (min(xs) + max(xs)) / 2.0
+        shift_y = cy - (min(ys) + max(ys)) / 2.0
+        cons = Construction((shift_x, shift_y), float(rot), pieces, conns)
+        return cons
 
     def _legacy_search(self, best_score: float):
         """Proven shape library (rectangles, tiled rectangles, octagons) placed
