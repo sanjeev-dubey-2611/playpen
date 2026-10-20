@@ -645,7 +645,6 @@ class Player9(Player):
         from shapely.ops import unary_union
 
         room = self.room.polygon
-        prepared = prep(room.buffer(TOL))
         have_right = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
         if have_right < 4:
             return None  # a rectilinear loop needs at least 4 right corners
@@ -1051,22 +1050,6 @@ class Player9(Player):
                                       ((0, side), (2, side),
                                        (4, side), (6, side)), 0.0))
                     break  # one fitting square per position is enough
-        # a diagonal diamond seed for rooms where right connectors are scarce
-        # but diagonals are plentiful (the rectilinear seeds can't start there).
-        if rights < 4 and diagonals >= 4:
-            d = max(5, min(MAX_FACE_LENGTH, min_gate + 5))
-            for cx, cy in positions:
-                # diamond: headings 1,3,5,7 (45-degree edges), all 90-degree
-                # turns between them -> uses RIGHT connectors actually; instead
-                # use a rotated square via directions 1,3,5,7 with DIAGONAL
-                # turns is not closed. Use an axis diamond of diagonal faces:
-                dia = _P([(cx, cy - d), (cx + d, cy),
-                          (cx, cy + d), (cx - d, cy)])
-                if room.buffer(TOL).contains(dia):
-                    # faces headings 7,1,3,5 (NE,NW,SW,SE) each length d*sqrt2
-                    # rounded; turns of 2 (90) between them -> RIGHT. not ideal
-                    # when rights scarce, so skip unless it validates later.
-                    pass
         # de-duplicate seeds by (start, faces)
         uniq = {}
         for s in seeds:
