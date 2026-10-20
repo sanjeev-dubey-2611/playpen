@@ -78,7 +78,7 @@ class Player9(Player):
         # the later template/hug searches can't starve it. competes on true
         # score -> never regresses. ----
         if time.process_time() < deadline:
-            ff_deadline = min(deadline, time.process_time() + 150.0)
+            ff_deadline = min(deadline, time.process_time() + 110.0)
             ff = self._freeform_grow(ff_deadline)
             if ff is not None:
                 fs = self._score_cons(ff)
@@ -361,6 +361,17 @@ class Player9(Player):
             if lscore > best_score:
                 best, best_score = lcons, lscore
                 self.note = f"(b) legacy shape score {lscore:.1f}"
+
+        # ---- final polish: re-run the free-form grower seeded from the best
+        # result so far, so it can slide that shape's corners out into any room
+        # the fixed-shape searches left unused. only if time remains. ----
+        if best is not None and time.process_time() < deadline:
+            ff2 = self._freeform_grow(deadline, seed_cons=best)
+            if ff2 is not None:
+                f2 = self._score_cons(ff2)
+                if f2 > best_score:
+                    best, best_score = ff2, f2
+                    self.note = f"(a) free-form polish score {f2:.1f}"
 
         if best is None:
             self.note = "No valid positive-scoring enclosure found."
@@ -860,7 +871,7 @@ class Player9(Player):
                             best, best_score = cons, sc
         return best
 
-    def _freeform_grow(self, deadline) -> Construction | None:
+    def _freeform_grow(self, deadline, seed_cons=None) -> Construction | None:
         """Grow a free-form loop that fills the room (ported mechanism from a
         shared class algorithm). Starts from seed loops (the grid-fill block and
         a fitting rectangle), then repeatedly slides runs of corners outward to
@@ -1007,6 +1018,13 @@ class Player9(Player):
         grid = self._grid_fill(min(deadline, time.process_time() + 20.0))
         if grid is not None:
             lp = loop_from_cons(grid)
+            if lp is not None:
+                seeds.append(lp)
+        # refine an externally supplied best construction too (e.g. the best
+        # the template / hug / maximal searches found): the grower can polish
+        # it by sliding corners outward into unused room.
+        if seed_cons is not None:
+            lp = loop_from_cons(seed_cons)
             if lp is not None:
                 seeds.append(lp)
         minx, miny, maxx, maxy = room.bounds
@@ -1398,6 +1416,8 @@ class Player9(Player):
         conns: list[Connector] = []
         for ei in range(n):
             for si, (ptype, L) in enumerate(edge_runs[ei]):
+                if L < 5:
+                    return None  # never emit a sub-5 piece (would crash Piece)
                 pieces.append(Piece(ptype, L))
                 conns.append(corner_conns[ei] if si == 0
                              else Connector(ConnectorType.STRAIGHT, False))
