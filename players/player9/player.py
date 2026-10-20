@@ -641,6 +641,23 @@ class Player9(Player):
                 if (w, h) not in cell_pairs:
                     cell_pairs.append((w, h))
 
+        # candidate grid rotations: axis-aligned plus the room's own edge
+        # directions, so a grid can line up with a slanted wall and step it
+        # cheaply instead of leaving a staircase gap. a rotated rectilinear
+        # loop is still all 90-degree corners (just at a rotated base heading),
+        # which _trace_rectilinear builds directly.
+        import math as _m
+        room_corners = list(room.exterior.coords)[:-1]
+        angles = {0.0}
+        for i in range(len(room_corners)):
+            ax, ay = room_corners[i]
+            bx, by = room_corners[(i + 1) % len(room_corners)]
+            ang = _m.degrees(_m.atan2(by - ay, bx - ax)) % 90.0
+            angles.add(round(ang, 3))
+        # keep a small set (axis-aligned first, then up to 5 distinct wall
+        # angles) so we don't blow the time budget.
+        rot_angles = [0.0] + sorted(a for a in angles if a > 0.5 and a < 89.5)[:5]
+
         best = None
         best_score = float("-inf")
         NEIGH = ((1, 0), (-1, 0), (0, 1), (0, -1))
@@ -750,64 +767,141 @@ class Player9(Player):
             return False
 
         minx, miny, maxx, maxy = room.bounds
-        for w, h in cell_pairs:
+        from shapely import affinity
+        for rot in rot_angles:
             if time.process_time() >= deadline:
                 break
-            most_x = int(MAX_FACE_LENGTH // w)
-            most_y = int(MAX_FACE_LENGTH // h)
-            if most_x < 1 or most_y < 1:
-                continue
-            for sx in (0.0, 0.5):
-                for sy in (0.0, 0.5):
-                    if time.process_time() >= deadline:
-                        break
-                    # integer cell indices (a, b) -> box [a*w,(a+1)*w]x[b*h,...]
-                    ox = minx - sx * w
-                    oy = miny - sy * h
-                    cells = set()
-                    a = 0
-                    x = ox
-                    while x < maxx:
-                        b = 0
-                        y = oy
-                        while y < maxy:
-                            if prepared.contains(_box(x, y, x + w, y + h)):
-                                cells.add((a, b))
-                            b += 1
-                            y += h
-                        a += 1
-                        x += w
-                    if len(cells) < 4:
-                        continue
-                    cells = largest_component(cells)
-                    drop_pinches(cells)
-                    cells = largest_component(cells)
-                    if len(cells) < 4:
-                        continue
-                    if not break_long_sides(cells, most_x, most_y):
-                        continue
-                    boxes = [_box(ox + a * w, oy + b * h,
-                                  ox + (a + 1) * w, oy + (b + 1) * h)
-                             for a, b in cells]
-                    block = unary_union(boxes)
-                    if block.geom_type != "Polygon" or block.interiors:
-                        continue
-                    if block.area <= 0 or not block.exterior.is_simple:
-                        continue
-                    if not room.buffer(TOL).contains(block):
-                        continue
-                    # drop collinear vertices so a straight run of k cells is
-                    # ONE face (up to 30 units) instead of k 5-unit faces -- a
-                    # long face can seat a gate and spends far fewer connectors.
-                    block = block.simplify(0.0)
-                    built = self._trace_polygon(block)
-                    if built is None:
-                        continue
-                    cons = Construction(built[0], built[1], built[2], built[3])
-                    sc = self._score_cons(cons)
-                    if sc > best_score:
-                        best, best_score = cons, sc
+            # rasterize in a frame where the grid is axis-aligned: rotate the
+            # room by -rot, grid it, then the block is rotated back by +rot.
+            if rot == 0.0:
+                rroom = room
+            else:
+                rroom = affinity.rotate(room, -rot, origin=(0, 0))
+            rprep = prep(rroom.buffer(TOL))
+            rminx, rminy, rmaxx, rmaxy = rroom.bounds
+            for w, h in cell_pairs:
+                if time.process_time() >= deadline:
+                    break
+                most_x = int(MAX_FACE_LENGTH // w)
+                most_y = int(MAX_FACE_LENGTH // h)
+                if most_x < 1 or most_y < 1:
+                    continue
+                for sx in (0.0, 0.5):
+                    for sy in (0.0, 0.5):
+                        if time.process_time() >= deadline:
+                            break
+                        ox = rminx - sx * w
+                        oy = rminy - sy * h
+                        cells = set()
+                        a = 0
+                        x = ox
+                        while x < rmaxx:
+                            b = 0
+                            y = oy
+                            while y < rmaxy:
+                                if rprep.contains(_box(x, y, x + w, y + h)):
+                                    cells.add((a, b))
+                                b += 1
+                                y += h
+                            a += 1
+                            x += w
+                        if len(cells) < 4:
+                            continue
+                        cells = largest_component(cells)
+                        drop_pinches(cells)
+                        cells = largest_component(cells)
+                        if len(cells) < 4:
+                            continue
+                        if not break_long_sides(cells, most_x, most_y):
+                            continue
+                        boxes = [_box(ox + a * w, oy + b * h,
+                                      ox + (a + 1) * w, oy + (b + 1) * h)
+                                 for a, b in cells]
+                        block = unary_union(boxes)
+                        if block.geom_type != "Polygon" or block.interiors:
+                            continue
+                        if block.area <= 0 or not block.exterior.is_simple:
+                            continue
+                        # collinear-merge so each straight run of cells is one
+                        # face (up to 30 units) that can seat a gate.
+                        block = block.simplify(0.0)
+                        if rot == 0.0:
+                            if not room.buffer(TOL).contains(block):
+                                continue
+                            built = self._trace_polygon(block)
+                        else:
+                            # rotate the block back into the room's frame; it is
+                            # a rectilinear loop at base heading `rot`.
+                            wblock = affinity.rotate(block, rot, origin=(0, 0))
+                            if not room.buffer(TOL).contains(wblock):
+                                continue
+                            built = self._trace_rectilinear(block, rot)
+                        if built is None:
+                            continue
+                        cons = Construction(built[0], built[1], built[2], built[3])
+                        sc = self._score_cons(cons)
+                        if sc > best_score:
+                            best, best_score = cons, sc
         return best
+
+    def _trace_rectilinear(self, block, rot_deg):
+        """Trace an axis-aligned cell block whose loop will sit at base heading
+        `rot_deg` in the room. Every corner is 90/270 (a RIGHT connector) and
+        every edge is an integer piece length; the absolute heading is rotated
+        but that does not change the connectors. Returns
+        (start, heading, pieces, connectors) or None."""
+        pts = list(block.exterior.coords)[:-1]
+        n = len(pts)
+        if n < 3:
+            return None
+        signed = sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+                     for i in range(n))
+        if signed < 0:
+            pts = pts[::-1]
+        # in the axis-aligned frame, headings are 0/90/180/270; corner turns are
+        # +-90. edges are axis lengths (integer). build corner connectors + edges.
+        hd = [math.degrees(math.atan2(pts[(i + 1) % n][1] - pts[i][1],
+                                      pts[(i + 1) % n][0] - pts[i][0])) % 360
+              for i in range(n)]
+        corner_conns = []
+        budget = {
+            ConnectorType.RIGHT: self.inventory.connectors.get(ConnectorType.RIGHT, 0),
+            ConnectorType.STRAIGHT:
+                self.inventory.connectors.get(ConnectorType.STRAIGHT, 0),
+        }
+        for i in range(n):
+            turn = (hd[i] - hd[(i - 1) % n] + 180.0) % 360.0 - 180.0
+            internal = round((180.0 - turn) % 360.0)
+            if abs(internal - 90) < 2:
+                conn = Connector(ConnectorType.RIGHT, False)
+            elif abs(internal - 270) < 2:
+                conn = Connector(ConnectorType.RIGHT, True)
+            elif abs(internal - 180) < 2:
+                conn = Connector(ConnectorType.STRAIGHT, False)
+            else:
+                return None  # not rectilinear
+            corner_conns.append(conn)
+            budget[conn.connector_type] -= 1
+            if budget[conn.connector_type] < 0:
+                return None
+        edges = []
+        for i in range(n):
+            dx = pts[(i + 1) % n][0] - pts[i][0]
+            dy = pts[(i + 1) % n][1] - pts[i][1]
+            edges.append(math.hypot(dx, dy))
+        if any(abs(e - round(e)) > 0.05 for e in edges):
+            return None
+        straight_budget = budget[ConnectorType.STRAIGHT]
+        built = self._tile_outline_global(edges, corner_conns, straight_budget)
+        if built is None:
+            return None
+        pieces, conns = built
+        # rotate the start point into the room frame and offset the heading.
+        th = math.radians(rot_deg)
+        c_, s_ = math.cos(th), math.sin(th)
+        sx = pts[0][0] * c_ - pts[0][1] * s_
+        sy = pts[0][0] * s_ + pts[0][1] * c_
+        return (sx, sy), hd[0] + rot_deg, pieces, conns
 
     def _trace_polygon(self, poly) -> tuple | None:
         """Build pieces+connectors that trace `poly`'s boundary exactly. Returns
