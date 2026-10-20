@@ -52,8 +52,8 @@ MAX_FACES = 80
 # A run may be cut at any two corners when the loop has at most this many faces,
 # and otherwise only at corners this many faces apart: a long run moving is the
 # same as several short ones, and trying every pair costs too much.
-ALL_CORNERS_UP_TO = 16
-CORNER_REACH = 4
+ALL_CORNERS_UP_TO = 24
+CORNER_REACH = 8
 ASSIGN_TRIES = 40  # how many of a step's best fitting candidates get pieces assigned
 KICKS = 8  # face-adding moves tried from each stuck loop
 BEAM = 3
