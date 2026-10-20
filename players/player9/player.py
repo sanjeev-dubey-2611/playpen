@@ -865,12 +865,13 @@ class Player9(Player):
         orthogonal grid leaves area on the table (corridors, cut-outs, slanted
         walls). Competes on true score -> never regresses."""
         import numpy as np
-        from shapely.prepared import prep as _prep
+        import shapely as _sh
 
         from players.player9.freeform import Grower, Loop
 
         room = self.room.polygon
-        region = _prep(room.buffer(TOL))
+        region = room.buffer(TOL)
+        _sh.prepare(region)  # in-place spatial index; stays a plain Geometry
         room_corners = np.array(room.exterior.coords[:-1])
 
         rights = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
