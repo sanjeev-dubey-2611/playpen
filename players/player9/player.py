@@ -1,24 +1,27 @@
 """Player 9 — build the biggest, cheapest enclosure that fits in the room.
 
-The score rewards area and punishes perimeter, so we try a few strategies and
-keep whichever one actually scores best (checked with the real scorer):
+Score = area (good) - perimeter (bad) + a bonus for a 2nd gate on another face.
+No single trick wins every room, so we run a PORTFOLIO of shape builders and
+keep whichever result scores best by the real scorer. Each builder is gated on
+true score, so a bad attempt is simply ignored -- adding one can only help.
 
-1. Shape search: try rectangles, hexagons, octagons and L-shapes at many
-   integer sizes. For each one, work out how to build its sides from the
-   pieces we have (without running out of straight connectors), then try to
-   place it in the room at lots of angles and positions. Octagons usually win
-   in open rooms because they pack in a lot of area.
+Builders, in the order build_enclosure runs them (each time-sliced):
+  1. grid-fill      - fill the largest block of grid cells (best on spirals /
+                      cut-outs); cheap, so it runs first for a strong baseline.
+  2. free-form grow - slide a loop's corners outward to swallow space (the
+                      strongest all-rounder; gets the biggest time slice).
+  3. best-rectangle - exhaustive scan of axis-aligned rectangles (safety net
+                      for tight rooms where the growers get stuck).
+  4. notched-band   - long band with 45-deg V-notches for thin corridors (trades
+                      scarce straight connectors for abundant diagonals).
+  5. chain-shape    - ROTATED rectilinear shapes built piece-by-piece, for rooms
+                      whose best fit is tilted to their own axis (small rooms).
+  6. templates / boundary-hug / maximal-shape / legacy library - more fallbacks.
+  7. free-form polish - re-grow from the best-so-far to grab any last space.
 
-2. Boundary hug: for odd / concave rooms, follow the room's own outline just
-   inside the walls. The room shape itself holds the most area, so hugging it
-   beats any fixed shape when we have enough pieces to go all the way around.
-
-3. Safety net: a small library of known-good shapes, so we never do worse than
-   before even when the fancier strategies come up empty.
-
-We spend the available CPU time searching and return the best valid result.
-Some ideas here were inspired by other groups' write-ups (group 2's side
-allocation and group 10's edge hugging) and a teammate's wall-alignment idea.
+Everything is capped by a shared CPU deadline and returns the best valid result
+found so far. Some ideas were inspired by other groups' write-ups (group 2's
+side allocation, group 10's edge hugging) and a teammate's wall-alignment idea.
 """
 
 import math
@@ -49,6 +52,9 @@ ALLOCATION_NODE_LIMIT = 20000
 
 
 class Player9(Player):
+    # ======================================================================
+    # Entry point: run every builder, keep the highest true-scoring result.
+    # ======================================================================
     def build_enclosure(self) -> Construction | None:
         deadline = time.process_time() + SEARCH_CPU_SECONDS
         best = None
@@ -416,12 +422,13 @@ class Player9(Player):
             self.note = "No valid positive-scoring enclosure found."
         return best
 
+    # ======================================================================
+    # Direct shape builders (scan a shape family, build + score, keep best).
+    # ======================================================================
     def _best_rectangle(self, deadline) -> Construction | None:
-        """Scan for the single highest-scoring axis-aligned rectangle that fits
-        in the room and can be built from inventory. Cheap and exhaustive on
-        small/medium rooms -- guarantees we never lose to a simple-rectangle
-        opponent on rooms where our greedy growers get trapped (e.g. tight
-        spiral rooms where only a small box fits). Competes on true score."""
+        """Scan every axis-aligned rectangle that fits and is buildable, keep
+        the highest-scoring one. Our safety net for tight rooms where the
+        growers get stuck (e.g. a spiral room where only a small box fits)."""
         from shapely.geometry import Polygon as _P
         from shapely.prepared import prep as _prep
 
@@ -468,21 +475,12 @@ class Player9(Player):
         return best
 
     def _notched_band(self, deadline) -> Construction | None:
-        """For thin/long rooms, build a full-height band spanning the long axis
-        with periodic 45-degree V-notches on its two long edges. A plain
-        rectangle in a thin room is capped by the scarce STRAIGHT connectors
-        (each collinear join of two walls costs one). A V-notch breaks a long
-        edge with two DIAGONAL corners (usually far more plentiful) instead of a
-        straight join, so a much LONGER band fits within budget -- capturing
-        more area. This mirrors the elongated notched-band shape that scores
-        best in narrow corridors. Competes on true score, so it only ever helps.
-
-        A V-notch of leg `g` (an integer wall length, >=5) dips the edge inward
-        by g/sqrt(2):  ... -> P -> (P + g at +45) -> (back out g at -45) -> ...
-        Both legs are buildable diagonal walls; the two junctions and the valley
-        are 135-degree (DIAGONAL) corners. Only the 4 band end-caps are right
-        angles, so the scarce RIGHT/STRAIGHT connectors are barely touched.
-        """
+        """For thin/long rooms: a full-height band along the long axis with
+        periodic 45-deg V-notches on both edges. A plain rectangle in a thin
+        room runs out of STRAIGHT connectors; each V-notch replaces a straight
+        join with two DIAGONAL corners (usually far more plentiful), so a much
+        longer band fits -- more area. A notch of leg `g` dips the edge in by
+        g/sqrt(2); both legs are buildable diagonal walls."""
         from shapely.geometry import Polygon as _P
         from shapely.prepared import prep as _prep
 
@@ -640,23 +638,16 @@ class Player9(Player):
         return [to_world(uu, vv) for uu, vv in pts]
 
     def _chain_shape(self, deadline) -> Construction | None:
-        """Piece-chaining candidate generator for ROTATED rectilinear shapes.
+        """Builds ROTATED rectilinear shapes (rectangle / plus / pinwheel) the
+        way the engine does: a turtle walk of integer-length PIECES at an
+        arbitrary start heading. Vertices may land on non-integer points (fine),
+        only piece lengths need be integers -- so this reaches shapes our
+        vertex-based tracers reject as 'non-integer edge'. Unblocks rooms whose
+        best fit is tilted to their own axis (e.g. star).
 
-        Our other generators build a polygon from geometric vertices, then
-        require every edge to be an integer length -- which a rotated shape
-        violates (its edges project to irrational lengths). This builds the
-        shape the way the engine itself does: as a turtle walk of integer-length
-        PIECES at an arbitrary start heading. The vertices land wherever they
-        land (non-integer is fine); only the piece lengths must be integers and
-        each linear face must be <= 30. This unblocks rooms whose best shape is a
-        rectangle / plus / pinwheel rotated to the room's own symmetry axis
-        (e.g. star, hard), which the lattice grower and vertex tracers cannot
-        represent.
-
-        We enumerate a handful of templates as rings of (edge_length, turn_sign)
-        (turn +1 = convex 90, -1 = reflex 270), scan rotation angle + a size
-        scale + center offset, place a gate on the first long-enough face, and
-        keep the best valid build (true score).
+        Each template is a ring of (edge_length, turn_sign) where +1 = convex
+        90, -1 = reflex 270. We scan rotation + center offset, place a gate, and
+        keep the best valid build.
         """
         room = self.room.polygon
         minx, miny, maxx, maxy = room.bounds
@@ -861,6 +852,9 @@ class Player9(Player):
         cons = Construction((shift_x, shift_y), float(rot), pieces, conns)
         return cons
 
+    # ======================================================================
+    # Template search + legacy shape library (safety-net fallbacks).
+    # ======================================================================
     def _legacy_search(self, best_score: float):
         """Proven shape library (rectangles, tiled rectangles, octagons) placed
         with the wall-aligned `_place`, then the room-aware L fallback. Returns
@@ -935,13 +929,17 @@ class Player9(Player):
             return None
         return verts
 
+    # ----- scoring helpers (every builder is gated through these) -----
     def _score_cons(self, cons: Construction) -> float:
+        """True score of a construction, or -inf if it isn't valid."""
         res = validate_construction(cons, self.room, self.inventory)
         if not res.valid:
             return float("-inf")
         return score_construction(res, self.weights)
 
     def _score_poly(self, area: float, perim: float, two_gates: bool) -> float:
+        """Score a shape from its raw area/perimeter (used to rank candidates
+        before building them)."""
         g = self.weights.G if two_gates else 0.0
         return 1000.0 + self.weights.A * area + self.weights.C * perim + g
 
@@ -1103,6 +1101,9 @@ class Player9(Player):
                 return cons
         return None
 
+    # ======================================================================
+    # Grid fill: rasterize the room and enclose the largest block of cells.
+    # ======================================================================
     def _grid_fill(self, deadline) -> Construction | None:
         """Rasterize the room: lay a grid of w-by-h cells over it, keep the
         cells wholly inside, take the largest 4-connected block, and trace that
@@ -1354,6 +1355,9 @@ class Player9(Player):
                             best, best_score = cons, sc
         return best
 
+    # ======================================================================
+    # Free-form grower: slide a loop's corners outward to fill the room.
+    # ======================================================================
     def _freeform_grow(self, deadline, seed_cons=None) -> Construction | None:
         """Grow a free-form loop that fills the room (ported mechanism from a
         shared class algorithm). Starts from seed loops (the grid-fill block and
@@ -1565,6 +1569,10 @@ class Player9(Player):
             return accepted["best"]
         return accepted["best"]
 
+    # ======================================================================
+    # Geometry -> pieces: turn a polygon/outline into buildable walls+gates
+    # (tracing, tiling edges, boundary-hug, long-face splitting).
+    # ======================================================================
     def _trace_rectilinear(self, block, rot_deg):
         """Trace an axis-aligned cell block whose loop will sit at base heading
         `rot_deg` in the room. Every corner is 90/270 (a RIGHT connector) and
@@ -2004,6 +2012,10 @@ class Player9(Player):
                     return cons
         return None
 
+    # ======================================================================
+    # Shape library + placement: fixed shapes (rect/tiled/octagon/L) and the
+    # helpers that tile their pieces and place them in the room.
+    # ======================================================================
     def _rectangles(self) -> list[tuple[float, list[Piece], list[Connector]]]:
         wl = sorted(
             L for L, n in self.inventory.walls.items() if n > 0 and 5 <= L <= 30
