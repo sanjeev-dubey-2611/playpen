@@ -57,6 +57,19 @@ class Player9(Player):
         right = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
         diagonal = self.inventory.connectors.get(ConnectorType.DIAGONAL, 0)
 
+        # ---- grid / rasterization FIRST: it is cheap (sub-second to a few
+        # seconds even on big rooms) and is the big winner on non-convex rooms
+        # (spirals, crowns, cut-out rooms). running it up front means the
+        # slower template / hug / maximal searches never starve it of time, and
+        # they then only need to beat an already-strong baseline. ----
+        if time.process_time() < deadline:
+            grid = self._grid_fill(min(deadline, time.process_time() + 90.0))
+            if grid is not None:
+                gs = self._score_cons(grid)
+                if gs > best_score:
+                    best, best_score = grid, gs
+                    self.note = f"(a) grid-fill score {gs:.1f}"
+
         # ---- piece stock as parallel (types, counts) lists ----
         types: list[Piece] = []
         stock: list[int] = []
@@ -322,21 +335,6 @@ class Player9(Player):
             if ts > best_score:
                 best, best_score = traced, ts
                 self.note = f"(a) room-traced score {ts:.1f}"
-
-        # ---- grid / rasterization: overlay a square grid on the room, keep the
-        # cells that sit fully inside it, take the largest connected block of
-        # them, and trace that block's rectilinear outline. this uses only
-        # right (90/270) and straight connectors -- no 45-degree pieces -- so it
-        # works on rooms whose walls aren't 45-degree multiples, where the
-        # outline-tracing families can't match the corners. competes on true
-        # score, so it never regresses the result. ----
-        if time.process_time() < deadline:
-            grid = self._grid_fill(deadline)
-            if grid is not None:
-                gs = self._score_cons(grid)
-                if gs > best_score:
-                    best, best_score = grid, gs
-                    self.note = f"(a) grid-fill score {gs:.1f}"
 
         # ---- safety net: the proven template library + wall-aligned placement.
         # covers rooms the parameterized search misses (odd concave shapes). it
