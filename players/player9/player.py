@@ -1769,25 +1769,6 @@ class Player9(Player):
             verts.append(v)
         return verts
 
-    @staticmethod
-    def _snap_lattice(x, y):
-        """Snap a point to the nearest Z + Z/sqrt(2) lattice point (coordinates
-        of a 45-degree integer-length walk). Keeps the enclosure buildable."""
-        sq = math.sqrt(2)
-        best = None
-        for dx in range(-60, 61):
-            ax = round(x - dx / sq)
-            px = ax + dx / sq
-            for dy in range(-60, 61):
-                ay = round(y - dy / sq)
-                py = ay + dy / sq
-                e = (px - x) ** 2 + (py - y) ** 2
-                if best is None or e < best[0]:
-                    best = (e, px, py)
-                    if e < 1e-9:
-                        return (px, py)
-        return (best[1], best[2])
-
     def _split_long_faces(self, verts, inset):
         """Break any straight run longer than 30 units into legal sub-faces by
         inserting a small rectangular inward notch, so no single face exceeds
@@ -1888,44 +1869,6 @@ class Player9(Player):
                 pieces.append(Piece(ptype, L))
                 conns.append(corner_conns[ei] if si == 0
                              else Connector(ConnectorType.STRAIGHT, False))
-        if len(conns) != len(pieces):
-            return None
-        return pieces, conns
-
-    def _tile_outline(self, edge_lengths, corner_conns):
-        """Legacy per-edge tiler kept for the old L-fallback path."""
-        walls = dict(self.inventory.walls)
-        gates = dict(self.inventory.gates)
-        straights = self.inventory.connectors.get(ConnectorType.STRAIGHT, 0)
-        n = len(edge_lengths)
-        targets = [int(round(e)) for e in edge_lengths]
-        if any(t < 5 for t in targets):
-            return None
-        gate_edges = {0}
-        if sum(gates.values()) >= 2 and n >= 3:
-            gate_edges.add(n // 2)
-        # tile the MOST-CONSTRAINED edges first. short edges (5, 10) have the
-        # fewest tilings, so allocate them before long edges grab all the small
-        # walls. order: gate edges first, then ascending length.
-        order = sorted(range(n), key=lambda i: (i not in gate_edges, targets[i]))
-        edge_runs = [None] * n
-        for ei in order:
-            segs = self._tile_run(targets[ei], walls, gates, ei in gate_edges)
-            if segs is None:
-                return None
-            edge_runs[ei] = segs
-        pieces: list[Piece] = []
-        conns: list[Connector] = []
-        for ei in range(n):
-            for si, (ptype, L) in enumerate(edge_runs[ei]):
-                pieces.append(Piece(ptype, L))
-                if si == 0:
-                    conns.append(corner_conns[ei])
-                else:
-                    if straights <= 0:
-                        return None
-                    straights -= 1
-                    conns.append(Connector(ConnectorType.STRAIGHT, False))
         if len(conns) != len(pieces):
             return None
         return pieces, conns
