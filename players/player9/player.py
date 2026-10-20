@@ -1011,15 +1011,49 @@ class Player9(Player):
                 seeds.append(lp)
         minx, miny, maxx, maxy = room.bounds
         from shapely.geometry import Polygon as _P
-        for frac in (0.3, 0.5):
-            w = min(MAX_FACE_LENGTH, max(5, int((maxx - minx) * frac)))
-            h = min(MAX_FACE_LENGTH, max(5, int((maxy - miny) * frac)))
-            cx, cy = room.centroid.x, room.centroid.y
-            x0, y0 = cx - w / 2, cy - h / 2
-            rect = _P([(x0, y0), (x0 + w, y0), (x0 + w, y0 + h), (x0, y0 + h)])
-            if room.buffer(TOL).contains(rect):
-                seeds.append(Loop((x0, y0), 0.0,
-                                  ((0, w), (2, h), (4, w), (6, h)), 0.0))
+        min_gate = min(gate_lengths)
+        # small-to-medium rectangles at several positions so corridors and
+        # separate pockets each get a seed to grow from. size each so a side
+        # can hold the smallest gate.
+        base_side = max(5, min(MAX_FACE_LENGTH, min_gate + 5))
+        positions = [(room.centroid.x, room.centroid.y)]
+        rp = room.representative_point()
+        positions.append((rp.x, rp.y))
+        for fx in (0.25, 0.5, 0.75):
+            for fy in (0.25, 0.5, 0.75):
+                positions.append((minx + (maxx - minx) * fx,
+                                  miny + (maxy - miny) * fy))
+        for cx, cy in positions:
+            for side in (base_side, min(MAX_FACE_LENGTH, base_side * 2)):
+                x0, y0 = cx - side / 2, cy - side / 2
+                rect = _P([(x0, y0), (x0 + side, y0),
+                           (x0 + side, y0 + side), (x0, y0 + side)])
+                if room.buffer(TOL).contains(rect):
+                    seeds.append(Loop((x0, y0), 0.0,
+                                      ((0, side), (2, side),
+                                       (4, side), (6, side)), 0.0))
+                    break  # one fitting square per position is enough
+        # a diagonal diamond seed for rooms where right connectors are scarce
+        # but diagonals are plentiful (the rectilinear seeds can't start there).
+        if rights < 4 and diagonals >= 4:
+            d = max(5, min(MAX_FACE_LENGTH, min_gate + 5))
+            for cx, cy in positions:
+                # diamond: headings 1,3,5,7 (45-degree edges), all 90-degree
+                # turns between them -> uses RIGHT connectors actually; instead
+                # use a rotated square via directions 1,3,5,7 with DIAGONAL
+                # turns is not closed. Use an axis diamond of diagonal faces:
+                dia = _P([(cx, cy - d), (cx + d, cy),
+                          (cx, cy + d), (cx - d, cy)])
+                if room.buffer(TOL).contains(dia):
+                    # faces headings 7,1,3,5 (NE,NW,SW,SE) each length d*sqrt2
+                    # rounded; turns of 2 (90) between them -> RIGHT. not ideal
+                    # when rights scarce, so skip unless it validates later.
+                    pass
+        # de-duplicate seeds by (start, faces)
+        uniq = {}
+        for s in seeds:
+            uniq[(round(s.start[0], 3), round(s.start[1], 3), s.faces)] = s
+        seeds = list(uniq.values())
         if not seeds:
             return None
 
