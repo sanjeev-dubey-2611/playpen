@@ -97,6 +97,18 @@ class Player9(Player):
                     best, best_score = rect, rs
                     self.note = f"(a) best-rectangle score {rs:.1f}"
 
+        # ---- notched band: long full-height band with 45-degree V-notches,
+        # for thin/corridor rooms where a plain rectangle is capped by scarce
+        # STRAIGHT connectors. Trades straights for abundant diagonals to fit a
+        # longer band. Competes on true score. ----
+        if time.process_time() < deadline:
+            band = self._notched_band(min(deadline, time.process_time() + 30.0))
+            if band is not None:
+                bs = self._score_cons(band)
+                if bs > best_score:
+                    best, best_score = band, bs
+                    self.note = f"(a) notched-band score {bs:.1f}"
+
         # ---- piece stock as parallel (types, counts) lists ----
         types: list[Piece] = []
         stock: list[int] = []
@@ -438,6 +450,178 @@ class Player9(Player):
                     if placed:
                         break
         return best
+
+    def _notched_band(self, deadline) -> Construction | None:
+        """For thin/long rooms, build a full-height band spanning the long axis
+        with periodic 45-degree V-notches on its two long edges. A plain
+        rectangle in a thin room is capped by the scarce STRAIGHT connectors
+        (each collinear join of two walls costs one). A V-notch breaks a long
+        edge with two DIAGONAL corners (usually far more plentiful) instead of a
+        straight join, so a much LONGER band fits within budget -- capturing
+        more area. This mirrors the elongated notched-band shape that scores
+        best in narrow corridors. Competes on true score, so it only ever helps.
+
+        A V-notch of leg `g` (an integer wall length, >=5) dips the edge inward
+        by g/sqrt(2):  ... -> P -> (P + g at +45) -> (back out g at -45) -> ...
+        Both legs are buildable diagonal walls; the two junctions and the valley
+        are 135-degree (DIAGONAL) corners. Only the 4 band end-caps are right
+        angles, so the scarce RIGHT/STRAIGHT connectors are barely touched.
+        """
+        from shapely.geometry import Polygon as _P
+        from shapely.prepared import prep as _prep
+
+        sq = math.sqrt(2)
+        have_diag = self.inventory.connectors.get(ConnectorType.DIAGONAL, 0)
+        have_right = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
+        if have_diag < 4 or have_right < 4:
+            return None
+
+        room = self.room.polygon
+        minx, miny, maxx, maxy = room.bounds
+        rw, rh = maxx - minx, maxy - miny
+        # only worthwhile on clearly elongated rooms
+        if min(rw, rh) < 5 or max(rw, rh) / max(min(rw, rh), 1e-9) < 2.0:
+            return None
+
+        # a length is usable for a single wall PIECE only if it can be tiled
+        # from inventory (a leg must be one buildable wall; segments/caps may be
+        # multi-piece runs). cache buildability of integer lengths.
+        def buildable_run(L):
+            return self._tile_run(L, dict(self.inventory.walls),
+                                  dict(self.inventory.gates), False) is not None
+
+        # leg must be a SINGLE diagonal wall whose length exists in stock
+        leg_lengths = sorted(L for L, c in self.inventory.walls.items()
+                             if c > 0 and 5 <= L <= MAX_FACE_LENGTH)
+        if not leg_lengths:
+            return None
+
+        pr = _prep(room.buffer(TOL))
+        best = None
+        best_score = float("-inf")
+
+        horizontal = rw >= rh
+        axis_len = rw if horizontal else rh
+        cross = rh if horizontal else rw
+
+        def to_world(u, v):
+            if horizontal:
+                return (minx + u, miny + v)
+            return (minx + v, miny + u)
+
+        seg_choices = [s for s in (6, 10, 12, 15, 18, 20, 24, 25, 30)
+                       if buildable_run(s)]
+        if not seg_choices:
+            return None
+
+        for inset in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0):
+            if time.process_time() >= deadline:
+                break
+            H = cross - 2 * inset
+            Hi = int(round(H))
+            if Hi < 5 or abs(H - Hi) > 0.05 or not buildable_run(Hi):
+                continue
+            for g in leg_lengths:
+                depth = g / sq
+                # Both long edges are notched (mirrored) so the loop closes with
+                # only integer-length pieces -- a single flat edge would have an
+                # irrational length (notch width = g*sqrt(2)) and be unbuildable.
+                # The band may locally NARROW where a top and bottom notch meet;
+                # that is fine -- the min-length rule applies to wall PIECES (the
+                # diagonal legs are length g >= 5), not to the band width. We
+                # only need the two notches not to cross (H - 2*depth > 0); a
+                # simple/valid check below enforces the rest.
+                both = True
+                if H - 2 * depth <= 0.5:
+                    continue
+                for seg in seg_choices:
+                    if time.process_time() >= deadline:
+                        break
+                    notch_w = 2 * depth
+                    period = seg + notch_w
+                    n = int((axis_len - 2 * inset - seg) // period)
+                    if n < 1:
+                        continue
+                    # connector budget (measured empirically for the mirrored
+                    # both-edge band): DIAGONAL = 4*n, RIGHT = 4 + 2*n.
+                    cap_d = have_diag // 4
+                    cap_r = (have_right - 4) // 2
+                    max_n = min(cap_d, cap_r)
+                    if max_n < 1:
+                        continue
+                    n = min(n, max_n)
+                    used = seg + n * period
+                    if used < 20:
+                        continue
+                    start_lo = inset
+                    start_hi = axis_len - inset - used
+                    if start_hi < start_lo - 1e-9:
+                        continue
+                    span = max(0.0, start_hi - start_lo)
+                    offsets = {start_lo, start_lo + span / 2, start_hi}
+                    for s0 in sorted(offsets):
+                        verts = self._band_vertices(s0, inset, H, depth, seg,
+                                                    n, to_world, both)
+                        if verts is None:
+                            continue
+                        try:
+                            poly = _P(verts)
+                        except Exception:
+                            continue
+                        if not poly.is_valid or poly.area <= 0:
+                            continue
+                        if not pr.contains(poly):
+                            continue
+                        built = self._trace_polygon(poly)
+                        if built is None:
+                            continue
+                        cons = Construction(*built)
+                        sc = self._score_cons(cons)
+                        if sc > best_score:
+                            best, best_score = cons, sc
+        return best
+
+    @staticmethod
+    def _band_vertices(s0, inset, H, depth, seg, n, to_world, both=True):
+        """Vertex ring of a notched band in local (u,v) coords mapped through
+        `to_world`. Bottom edge (v=v0) L->R with V dips UP by `depth`. If
+        `both`, the top edge (v=vt) R->L mirrors with V dips DOWN; otherwise the
+        top edge is a single flat run (used when the room is too short to notch
+        both edges). Each V leg is a 45-degree wall of geometric length
+        depth*sqrt(2)."""
+        v0 = inset
+        vt = inset + H
+        pts = []
+        u = s0
+        pts.append((u, v0))        # bottom-left cap
+        u += seg
+        pts.append((u, v0))
+        for _ in range(n):
+            pts.append((u + depth, v0 + depth))   # up the leg (into band)
+            pts.append((u + 2 * depth, v0))       # back down to edge
+            u += 2 * depth
+            u += seg
+            pts.append((u, v0))
+        pts.append((u, vt))        # right cap (vertical, RIGHT corner)
+        u_right = u
+        if both:
+            u2 = u_right - seg
+            pts.append((u2, vt))
+            for _ in range(n):
+                pts.append((u2 - depth, vt - depth))  # dip down (into band)
+                pts.append((u2 - 2 * depth, vt))
+                u2 -= 2 * depth
+                u2 -= seg
+                pts.append((u2, vt))
+            if abs(u2 - s0) > 1e-6:
+                return None
+        else:
+            # flat top edge straight back to the left cap. its length is the
+            # full band length; it will be split into <=30 runs by the tiler,
+            # which costs STRAIGHT connectors -- acceptable since only one edge
+            # is notched.
+            pts.append((s0, vt))
+        return [to_world(uu, vv) for uu, vv in pts]
 
     def _legacy_search(self, best_score: float):
         """Proven shape library (rectangles, tiled rectangles, octagons) placed
@@ -1236,18 +1420,18 @@ class Player9(Player):
             if corner_budget[conn.connector_type] < 0:
                 return None  # not enough corner connectors of this type
 
-        # each edge's buildable PIECE length: axis edge = geometric length;
-        # diagonal (45-deg) edge = geometric length / sqrt(2) (its integer leg).
-        sq = math.sqrt(2)
+        # each edge's buildable PIECE length == its geometric length. The
+        # engine advances a piece of length L by exactly L units along its
+        # heading (src/enclosure.py line ~102: dx = length*cos(theta)), so a
+        # diagonal (45-deg) wall of length L spans L geometric units too -- NOT
+        # L*sqrt(2). (Earlier code divided diagonals by sqrt(2), which built
+        # shapes smaller than intended.)
         edges = []
         for i in range(n):
             dx = pts[(i + 1) % n][0] - pts[i][0]
             dy = pts[(i + 1) % n][1] - pts[i][1]
             glen = math.hypot(dx, dy)
-            h = round(math.degrees(math.atan2(dy, dx)) % 90, 3)
-            is_diag = abs(h - 45) < 1.0
-            piece_len = glen / sq if is_diag else glen
-            edges.append(piece_len)
+            edges.append(glen)
         # reject if any edge isn't close to an integer buildable length
         if any(abs(e - round(e)) > 0.05 for e in edges):
             return None
