@@ -336,6 +336,18 @@ class Player9(Player):
                 best, best_score = traced, ts
                 self.note = f"(a) room-traced score {ts:.1f}"
 
+        # ---- free-form grow: slide a loop's corners outward to fill the room,
+        # including diagonal steps along slanted walls. captures area the fixed
+        # shapes and the orthogonal grid miss (corridors, cut-outs, odd
+        # concave rooms). given the remaining time; competes on true score. ----
+        if time.process_time() < deadline:
+            ff = self._freeform_grow(deadline)
+            if ff is not None:
+                fs = self._score_cons(ff)
+                if fs > best_score:
+                    best, best_score = ff, fs
+                    self.note = f"(a) free-form score {fs:.1f}"
+
         # ---- safety net: the proven template library + wall-aligned placement.
         # covers rooms the parameterized search misses (odd concave shapes). it
         # competes on true score, so it can only raise the result, never lower.
@@ -843,6 +855,191 @@ class Player9(Player):
                         if sc > best_score:
                             best, best_score = cons, sc
         return best
+
+    def _freeform_grow(self, deadline) -> Construction | None:
+        """Grow a free-form loop that fills the room (ported mechanism from a
+        shared class algorithm). Starts from seed loops (the grid-fill block and
+        a fitting rectangle), then repeatedly slides runs of corners outward to
+        swallow more room, keeping only loops the inventory can build and the
+        simulator accepts. Wins on non-convex rooms where a fixed shape or the
+        orthogonal grid leaves area on the table (corridors, cut-outs, slanted
+        walls). Competes on true score -> never regresses."""
+        import numpy as np
+        from shapely.prepared import prep as _prep
+
+        from players.player9.freeform import Grower, Loop
+
+        room = self.room.polygon
+        region = _prep(room.buffer(TOL))
+        room_corners = np.array(room.exterior.coords[:-1])
+
+        rights = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
+        diagonals = self.inventory.connectors.get(ConnectorType.DIAGONAL, 0)
+
+        wall_lengths = sorted(L for L, n in self.inventory.walls.items()
+                              if n > 0 and 5 <= L <= 30)
+        gate_lengths = sorted(L for L, n in self.inventory.gates.items()
+                              if n > 0 and 5 <= L <= 30)
+        if not gate_lengths or (rights < 4 and diagonals < 4):
+            return None
+        all_lengths = sorted(set(wall_lengths) | set(gate_lengths))
+        if not all_lengths:
+            return None
+        buildable = set()
+        reach = {0: 0}
+        for t in range(5, MAX_FACE_LENGTH + 1):
+            for p in all_lengths:
+                if p <= t and (t - p) in reach:
+                    reach[t] = min(reach.get(t, 99), reach[t - p] + 1)
+                    buildable.add(t)
+                    break
+        if not buildable:
+            return None
+        total_length = (sum(L * n for L, n in self.inventory.walls.items())
+                        + sum(L * n for L, n in self.inventory.gates.items()))
+
+        def score_fn(area, perimeter):
+            return (BASELINE_SCORE + self.weights.A * area
+                    + self.weights.C * perimeter + max(self.weights.G, 0.0))
+
+        def faces_to_cons(start, heading, faces):
+            n = len(faces)
+            if n < 3:
+                return None
+            walls = dict(self.inventory.walls)
+            gates = dict(self.inventory.gates)
+            cap = [i for i in range(n)
+                   if any(gl <= faces[i][1] and
+                          (faces[i][1] - gl == 0 or faces[i][1] - gl >= 5)
+                          for gl in gate_lengths)]
+            if not cap:
+                return None
+            gate_faces = {cap[0]}
+            if sum(gates.values()) >= 2:
+                far = max(cap, key=lambda i: min((i - cap[0]) % n, (cap[0] - i) % n))
+                if far != cap[0]:
+                    gate_faces.add(far)
+            pieces, conns = [], []
+            for i in range(n):
+                h, length = faces[i]
+                ph = faces[(i - 1) % n][0]
+                t = (h - ph) % 8
+                if t == 2:
+                    corner = Connector(ConnectorType.RIGHT, False)
+                elif t == 6:
+                    corner = Connector(ConnectorType.RIGHT, True)
+                elif t == 1:
+                    corner = Connector(ConnectorType.DIAGONAL, False)
+                elif t == 7:
+                    corner = Connector(ConnectorType.DIAGONAL, True)
+                else:
+                    return None
+                segs = self._tile_run(int(round(length)), walls, gates,
+                                      i in gate_faces)
+                if segs is None:
+                    return None
+                for k, (ptype, L) in enumerate(segs):
+                    if L < 5:
+                        return None  # safety: never emit a sub-5 piece
+                    pieces.append(Piece(ptype, L))
+                    conns.append(corner if k == 0
+                                 else Connector(ConnectorType.STRAIGHT, False))
+            # start_heading is the WORLD direction of face 0 (heading of index 0
+            # plus 45 deg per direction-index step).
+            start_heading = heading + 45.0 * faces[0][0]
+            return Construction((start[0], start[1]), start_heading, pieces, conns)
+
+        def can_build(lengths):
+            walls = dict(self.inventory.walls)
+            gates = dict(self.inventory.gates)
+            for L in lengths:
+                if self._tile_run(int(round(L)), walls, gates, False) is None:
+                    return False
+            return True
+
+        accepted = {"best": None, "score": float("-inf")}
+
+        def accept(start, heading, faces):
+            try:
+                cons = faces_to_cons(start, heading, faces)
+            except Exception:
+                return None
+            if cons is None:
+                return None
+            res = validate_construction(cons, self.room, self.inventory)
+            if not res.valid:
+                return None
+            sc = score_construction(res, self.weights)
+            if sc > accepted["score"]:
+                accepted["best"], accepted["score"] = cons, sc
+            return sc
+
+        seeds = []
+
+        def loop_from_cons(cons):
+            pts = walk_points(cons)[:-1]
+            n = len(pts)
+            faces = []
+            for i in range(n):
+                dx = pts[(i + 1) % n][0] - pts[i][0]
+                dy = pts[(i + 1) % n][1] - pts[i][1]
+                length = round(math.hypot(dx, dy))
+                if length < 1:
+                    continue
+                ang = round((math.degrees(math.atan2(dy, dx)) % 360) / 45) % 8
+                faces.append((ang, length))
+            if len(faces) < 3:
+                return None
+            merged = []
+            for h, length in faces:
+                if merged and merged[-1][0] == h:
+                    merged[-1] = (h, merged[-1][1] + length)
+                else:
+                    merged.append((h, length))
+            sc = self._score_cons(cons)
+            return Loop(pts[0], 0.0, tuple(merged), sc if sc > 0 else 0.0)
+
+        grid = self._grid_fill(min(deadline, time.process_time() + 20.0))
+        if grid is not None:
+            lp = loop_from_cons(grid)
+            if lp is not None:
+                seeds.append(lp)
+        minx, miny, maxx, maxy = room.bounds
+        from shapely.geometry import Polygon as _P
+        for frac in (0.3, 0.5):
+            w = min(MAX_FACE_LENGTH, max(5, int((maxx - minx) * frac)))
+            h = min(MAX_FACE_LENGTH, max(5, int((maxy - miny) * frac)))
+            cx, cy = room.centroid.x, room.centroid.y
+            x0, y0 = cx - w / 2, cy - h / 2
+            rect = _P([(x0, y0), (x0 + w, y0), (x0 + w, y0 + h), (x0, y0 + h)])
+            if room.buffer(TOL).contains(rect):
+                seeds.append(Loop((x0, y0), 0.0,
+                                  ((0, w), (2, h), (4, w), (6, h)), 0.0))
+        if not seeds:
+            return None
+
+        # accept each seed up front: the grower only validates grown loops, so
+        # without this a perfectly good seed (e.g. the grid-fill block) could be
+        # lost if no improving move happens to be accepted.
+        for s in seeds:
+            accept(s.start, s.heading, s.faces)
+
+        grower = Grower(
+            region=region,
+            room_corners=room_corners,
+            buildable=buildable,
+            rights=rights,
+            diagonals=diagonals,
+            total_length=total_length,
+            score=score_fn,
+            accept=accept,
+            can_build=can_build,
+        )
+        try:
+            grower.grow(seeds, deadline, first_charge=max(self.weights.A, 0.1))
+        except Exception:
+            return accepted["best"]
+        return accepted["best"]
 
     def _trace_rectilinear(self, block, rot_deg):
         """Trace an axis-aligned cell block whose loop will sit at base heading
