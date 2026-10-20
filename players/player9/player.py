@@ -323,6 +323,21 @@ class Player9(Player):
                 best, best_score = traced, ts
                 self.note = f"(a) room-traced score {ts:.1f}"
 
+        # ---- grid / rasterization: overlay a square grid on the room, keep the
+        # cells that sit fully inside it, take the largest connected block of
+        # them, and trace that block's rectilinear outline. this uses only
+        # right (90/270) and straight connectors -- no 45-degree pieces -- so it
+        # works on rooms whose walls aren't 45-degree multiples, where the
+        # outline-tracing families can't match the corners. competes on true
+        # score, so it never regresses the result. ----
+        if time.process_time() < deadline:
+            grid = self._grid_fill(deadline)
+            if grid is not None:
+                gs = self._score_cons(grid)
+                if gs > best_score:
+                    best, best_score = grid, gs
+                    self.note = f"(a) grid-fill score {gs:.1f}"
+
         # ---- safety net: the proven template library + wall-aligned placement.
         # covers rooms the parameterized search misses (odd concave shapes). it
         # competes on true score, so it can only raise the result, never lower.
@@ -579,6 +594,223 @@ class Player9(Player):
                 return cons
         return None
 
+    def _grid_fill(self, deadline) -> Construction | None:
+        """Rasterize the room: lay a grid of w-by-h cells over it, keep the
+        cells wholly inside, take the largest 4-connected block, and trace that
+        block's outline into pieces.
+
+        The block's outline has only right (90/270) and straight corners -- no
+        45-degree pieces. Two things make it buildable from any inventory:
+
+        * cell width/height are chosen from the lengths we actually stock, so
+          every east-west side is a whole number of ``w`` and every north-south
+          side a whole number of ``h`` -- always tileable;
+        * a straight run over the 30-unit face limit is notched by dropping one
+          cell along it (adds two corners), and cells that touch only at a
+          corner (which would make the outline self-touch) are dropped.
+
+        This is the method for big / non-45-degree rooms (spirals, blobby
+        concave rooms) where the outline-tracing families either reject the
+        corners or settle for one small shape. Competes on true score, so it
+        never regresses the result.
+        """
+        from collections import deque
+
+        from shapely.geometry import box as _box
+        from shapely.ops import unary_union
+
+        room = self.room.polygon
+        prepared = prep(room.buffer(TOL))
+        have_right = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
+        if have_right < 4:
+            return None  # a rectilinear loop needs at least 4 right corners
+
+        # cell dimensions come from the wall/gate lengths we stock, so every
+        # grid-aligned side is a multiple of a buildable length. keep a spread
+        # from small (fine fit, more perimeter) to large (coarse, cheap).
+        stock_lengths = sorted(
+            {L for L, n in self.inventory.walls.items() if n > 0 and 5 <= L <= 30}
+            | {L for L, n in self.inventory.gates.items() if n > 0 and 5 <= L <= 30}
+        )
+        if not stock_lengths:
+            return None
+        # candidate (w, h) pairs: same-length squares first (fewest distinct
+        # pieces), then a few mixed pairs so slanted walls step cheaply.
+        cell_pairs = [(s, s) for s in stock_lengths]
+        small = stock_lengths[:3]
+        for w in small:
+            for h in stock_lengths:
+                if (w, h) not in cell_pairs:
+                    cell_pairs.append((w, h))
+
+        best = None
+        best_score = float("-inf")
+        NEIGH = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+        def largest_component(cells):
+            left = set(cells)
+            best_block = set()
+            while left:
+                seed = left.pop()
+                block = {seed}
+                q = deque([seed])
+                while q:
+                    x, y = q.popleft()
+                    for dx, dy in NEIGH:
+                        nb = (x + dx, y + dy)
+                        if nb in left:
+                            left.remove(nb)
+                            block.add(nb)
+                            q.append(nb)
+                if len(block) > len(best_block):
+                    best_block = block
+            return best_block
+
+        def connected(cells):
+            if not cells:
+                return False
+            seed = next(iter(cells))
+            seen = {seed}
+            q = deque([seed])
+            while q:
+                x, y = q.popleft()
+                for dx, dy in NEIGH:
+                    nb = (x + dx, y + dy)
+                    if nb in cells and nb not in seen:
+                        seen.add(nb)
+                        q.append(nb)
+            return len(seen) == len(cells)
+
+        def pinches(cells, around=None):
+            found = []
+            for x, y in (around if around is not None else cells):
+                if (x, y) not in cells:
+                    continue
+                for dx, dy in ((1, 1), (1, -1)):
+                    if ((x + dx, y + dy) in cells
+                            and (x + dx, y) not in cells
+                            and (x, y + dy) not in cells):
+                        found.append((x, y))
+            return found
+
+        def drop_pinches(cells):
+            while True:
+                p = pinches(cells)
+                if not p:
+                    return
+                cells.discard(p[0])
+
+        def runs(cells):
+            rows, cols = [], []
+            for side in (-1, 1):
+                edge = sorted((y, x) for x, y in cells if (x, y + side) not in cells)
+                run = []
+                for y, x in edge:
+                    if run and run[-1] == (x - 1, y):
+                        run.append((x, y))
+                    else:
+                        if run:
+                            rows.append(run)
+                        run = [(x, y)]
+                if run:
+                    rows.append(run)
+            for side in (-1, 1):
+                edge = sorted((x, y) for x, y in cells if (x + side, y) not in cells)
+                run = []
+                for x, y in edge:
+                    if run and run[-1] == (x, y - 1):
+                        run.append((x, y))
+                    else:
+                        if run:
+                            cols.append(run)
+                        run = [(x, y)]
+                if run:
+                    cols.append(run)
+            return rows, cols
+
+        def break_long_sides(cells, most_x, most_y):
+            # most_x cells == 30 units along a row; notch anything longer by
+            # dropping a cell (keeping the block connected and pinch-free).
+            while time.process_time() < deadline:
+                rows, cols = runs(cells)
+                long = [(r, most_x) for r in rows if len(r) > most_x]
+                long += [(cc, most_y) for cc in cols if len(cc) > most_y]
+                if not long:
+                    return True
+                for run, most in long:
+                    for k in range(most, 0, -1):
+                        cell = run[k]
+                        cells.discard(cell)
+                        x, y = cell
+                        near = [(x + dx, y + dy)
+                                for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+                        if not pinches(cells, near) and connected(cells):
+                            break
+                        cells.add(cell)
+                    else:
+                        return False
+            return False
+
+        minx, miny, maxx, maxy = room.bounds
+        for w, h in cell_pairs:
+            if time.process_time() >= deadline:
+                break
+            most_x = int(MAX_FACE_LENGTH // w)
+            most_y = int(MAX_FACE_LENGTH // h)
+            if most_x < 1 or most_y < 1:
+                continue
+            for sx in (0.0, 0.5):
+                for sy in (0.0, 0.5):
+                    if time.process_time() >= deadline:
+                        break
+                    # integer cell indices (a, b) -> box [a*w,(a+1)*w]x[b*h,...]
+                    ox = minx - sx * w
+                    oy = miny - sy * h
+                    cells = set()
+                    a = 0
+                    x = ox
+                    while x < maxx:
+                        b = 0
+                        y = oy
+                        while y < maxy:
+                            if prepared.contains(_box(x, y, x + w, y + h)):
+                                cells.add((a, b))
+                            b += 1
+                            y += h
+                        a += 1
+                        x += w
+                    if len(cells) < 4:
+                        continue
+                    cells = largest_component(cells)
+                    drop_pinches(cells)
+                    cells = largest_component(cells)
+                    if len(cells) < 4:
+                        continue
+                    if not break_long_sides(cells, most_x, most_y):
+                        continue
+                    boxes = [_box(ox + a * w, oy + b * h,
+                                  ox + (a + 1) * w, oy + (b + 1) * h)
+                             for a, b in cells]
+                    block = unary_union(boxes)
+                    if block.geom_type != "Polygon" or block.interiors:
+                        continue
+                    if block.area <= 0 or not block.exterior.is_simple:
+                        continue
+                    if not room.buffer(TOL).contains(block):
+                        continue
+                    # drop collinear vertices so a straight run of k cells is
+                    # ONE face (up to 30 units) instead of k 5-unit faces -- a
+                    # long face can seat a gate and spends far fewer connectors.
+                    block = block.simplify(0.0)
+                    built = self._trace_polygon(block)
+                    if built is None:
+                        continue
+                    cons = Construction(built[0], built[1], built[2], built[3])
+                    sc = self._score_cons(cons)
+                    if sc > best_score:
+                        best, best_score = cons, sc
+        return best
+
     def _trace_polygon(self, poly) -> tuple | None:
         """Build pieces+connectors that trace `poly`'s boundary exactly. Returns
         (start, heading, pieces, connectors) or None if it can't be tiled from
@@ -795,11 +1027,34 @@ class Player9(Player):
         targets = [int(round(e)) for e in edge_lengths]
         if any(t < 5 for t in targets):
             return None
-        gate_edges = {0}
-        if sum(gates.values()) >= 2 and n >= 3:
-            gate_edges.add(n // 2)
+        # a gate edge must be long enough to actually hold one of the gates we
+        # own (and leave either 0 or >=5 units for the remaining wall run).
+        gate_lengths = sorted(L for L, cnt in gates.items() if cnt > 0 and 5 <= L <= 30)
 
-        order = sorted(range(n), key=lambda i: -targets[i])
+        def edge_fits_gate(t):
+            return any(gl <= t and (t - gl == 0 or t - gl >= 5) for gl in gate_lengths)
+
+        gate_edges: set[int] = set()
+        if gate_lengths:
+            # first gate: prefer the earliest edge that can hold a gate so the
+            # loop is guaranteed at least one gate (required for validity).
+            for i in range(n):
+                if edge_fits_gate(targets[i]):
+                    gate_edges.add(i)
+                    break
+            # second gate on a DIFFERENT face, for the G bonus -- only if we
+            # have >=2 gates and another gate-capable edge exists. pick one far
+            # from the first so they land on different faces.
+            if sum(gates.values()) >= 2 and len(gate_edges) == 1:
+                first = next(iter(gate_edges))
+                cand = [i for i in range(n)
+                        if i not in gate_edges and edge_fits_gate(targets[i])]
+                if cand:
+                    gate_edges.add(max(cand, key=lambda i: abs(i - first)))
+
+        # tile gate edges first so they claim gates before the shared wall/gate
+        # pool is spent, then the rest hardest (longest) first.
+        order = sorted(range(n), key=lambda i: (i not in gate_edges, -targets[i]))
         edge_runs = [None] * n
         used_straight = 0
         for ei in order:
