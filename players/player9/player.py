@@ -63,12 +63,28 @@ class Player9(Player):
         # slower template / hug / maximal searches never starve it of time, and
         # they then only need to beat an already-strong baseline. ----
         if time.process_time() < deadline:
-            grid = self._grid_fill(min(deadline, time.process_time() + 90.0))
+            grid = self._grid_fill(min(deadline, time.process_time() + 60.0))
             if grid is not None:
                 gs = self._score_cons(grid)
                 if gs > best_score:
                     best, best_score = grid, gs
                     self.note = f"(a) grid-fill score {gs:.1f}"
+
+        # ---- free-form grow SECOND, with a large guaranteed slice: it is the
+        # biggest winner on corridors, cut-outs and odd concave rooms, slides a
+        # loop's corners outward (including diagonal steps) to fill space the
+        # fixed shapes and the grid leave behind. it seeds from the grid-fill
+        # block, so it can only extend that result. given most of the budget so
+        # the later template/hug searches can't starve it. competes on true
+        # score -> never regresses. ----
+        if time.process_time() < deadline:
+            ff_deadline = min(deadline, time.process_time() + 150.0)
+            ff = self._freeform_grow(ff_deadline)
+            if ff is not None:
+                fs = self._score_cons(ff)
+                if fs > best_score:
+                    best, best_score = ff, fs
+                    self.note = f"(a) free-form score {fs:.1f}"
 
         # ---- piece stock as parallel (types, counts) lists ----
         types: list[Piece] = []
@@ -335,18 +351,6 @@ class Player9(Player):
             if ts > best_score:
                 best, best_score = traced, ts
                 self.note = f"(a) room-traced score {ts:.1f}"
-
-        # ---- free-form grow: slide a loop's corners outward to fill the room,
-        # including diagonal steps along slanted walls. captures area the fixed
-        # shapes and the orthogonal grid miss (corridors, cut-outs, odd
-        # concave rooms). given the remaining time; competes on true score. ----
-        if time.process_time() < deadline:
-            ff = self._freeform_grow(deadline)
-            if ff is not None:
-                fs = self._score_cons(ff)
-                if fs > best_score:
-                    best, best_score = ff, fs
-                    self.note = f"(a) free-form score {fs:.1f}"
 
         # ---- safety net: the proven template library + wall-aligned placement.
         # covers rooms the parameterized search misses (odd concave shapes). it
